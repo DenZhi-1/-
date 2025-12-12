@@ -1,8 +1,6 @@
-from typing import Dict, List, Any
-import pandas as pd
-from datetime import datetime
-import numpy as np
+from typing import Dict, List, Any, Optional
 from collections import Counter
+from datetime import datetime
 import re
 
 class AudienceAnalyzer:
@@ -182,4 +180,5 @@ class AudienceAnalyzer:
         return {
             'similarity_score': min(similarity_score, 100),
             'common_characteristics': common_characteristics
+        }
         }
