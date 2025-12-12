@@ -274,6 +274,37 @@ async def main():
         await db.close()
         await vk_client.close()
         logger.info("Бот остановлен")
+        @dp.message(Command("test_vk"))
+async def cmd_test_vk(message: Message):
+    """Тестирование подключения к VK API"""
+    if message.from_user.id not in config.ADMIN_IDS:
+        await message.answer("❌ Эта команда только для администраторов")
+        return
+    
+    await message.answer("🔍 Тестирую подключение к VK API...")
+    
+    try:
+        result = await vk_client.test_connection()
+        
+        if result['success']:
+            await message.answer(
+                f"{result['message']}\n\n"
+                f"<b>Токен VK работает корректно!</b>\n"
+                f"API версия: {config.VK_API_VERSION}"
+            )
+        else:
+            await message.answer(
+                f"❌ <b>Проблема с подключением к VK API:</b>\n"
+                f"{result['message']}\n\n"
+                f"<i>Проверьте:</i>\n"
+                f"1. VK_SERVICE_TOKEN в настройках Railway\n"
+                f"2. Доступность VK API\n"
+                f"3. Права приложения VK"
+            )
+            
+    except Exception as e:
+        logger.error(f"Ошибка тестирования VK: {e}", exc_info=True)
+        await message.answer(f"❌ Ошибка при тестировании: {str(e)}")
 
 if __name__ == "__main__":
     asyncio.run(main())
