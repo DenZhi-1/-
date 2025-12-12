@@ -26,6 +26,14 @@ class Config:
     DEBUG = os.getenv("DEBUG", "false").lower() == "true"
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
     
+    # VK API Configuration
+    VK_SERVICE_TOKEN = os.getenv("VK_SERVICE_TOKEN", "")
+    VK_API_VERSION = "5.199"
+    
+    # VK API Limits (запросов в секунду)
+    VK_REQUESTS_PER_SECOND = 3
+    REQUEST_DELAY = 1.0 / VK_REQUESTS_PER_SECOND  # ~0.33 секунды
+    
     @classmethod
     def validate(cls):
         errors = []
