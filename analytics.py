@@ -139,7 +139,7 @@ class AudienceAnalyzer:
         
         return recommendations[:5]  # Ограничиваем 5 рекомендациями
     
-    async def compare_audiences(self, analysis1: Dict, analysis2: Dict) -> Dict:
+    async def compare_audiences(self, analysis1: Dict, analysis2: Dict) -> Dict[str, Any]:
         """Сравнивает две аудитории"""
         similarity_score = 0
         common_characteristics = []
@@ -180,5 +180,4 @@ class AudienceAnalyzer:
         return {
             'similarity_score': min(similarity_score, 100),
             'common_characteristics': common_characteristics
-        }
         }
