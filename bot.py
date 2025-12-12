@@ -12,14 +12,17 @@ from analytics import AudienceAnalyzer
 from database import Database
 
 # Настройка логирования
+log_level = getattr(logging, config.LOG_LEVEL.upper(), logging.INFO)
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=log_level,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
-logger = logging.getLogger(__name__)
 
-# Диагностика: вывод полученного DATABASE_URL (первые 60 символов)
-logger.info(f"DATABASE_URL из конфига: {config.DATABASE_URL[:60]}...")
+logging.getLogger('aiogram').setLevel(logging.WARNING)
+logging.getLogger('aiohttp').setLevel(logging.WARNING)
+
+logger = logging.getLogger(__name__)
 
 # Валидация конфигурации
 try:
@@ -28,7 +31,10 @@ except ValueError as e:
     logger.error(str(e))
     raise
 
-# Инициализация бота с новым синтаксисом aiogram 3.7.0+
+# Диагностика
+logger.info(f"DATABASE_URL: {config.DATABASE_URL[:60]}...")
+
+# Инициализация бота
 bot = Bot(
     token=config.TELEGRAM_BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
@@ -45,8 +51,9 @@ async def cmd_start(message: Message):
         "/analyze [ссылка] - проанализировать аудиторию группы\n"
         "/compare [ссылка1] [ссылка2] - сравнить две аудитории\n"
         "/stats - моя статистика\n"
+        "/test_vk - тест подключения к VK (админы)\n"
         "/help - справка по использованию\n\n"
-        "⚠️ <i>Внимание: Для анализа доступны только открытые группы ВК.</i>"
+        "⚠️ <i>Для анализа доступны только открытые группы ВК.</i>"
     )
 
 @dp.message(Command("analyze"))
@@ -62,20 +69,17 @@ async def cmd_analyze(message: Message):
         
         logger.info(f"Пользователь {message.from_user.id} запросил анализ {group_link}")
         
-        # Получаем данные из ВК
         group_info = await vk_client.get_group_info(group_link)
         if not group_info:
             await message.answer("❌ Не удалось получить информацию о группе. Проверьте ссылку и доступность группы.")
             return
         
-        # Проверяем, что группа не приватная
         if group_info.get('members_count', 0) == 0:
             await message.answer("⚠️ Группа приватная или недоступна для анализа участников.")
             return
         
         await message.answer(f"📊 Группа: <b>{group_info['name']}</b>\n👥 Участников: {group_info['members_count']:,}\n\n⌛️ Собираю данные...")
         
-        # Получаем участников (ограничиваем для скорости)
         members_limit = min(1000, group_info['members_count'])
         members = await vk_client.get_group_members(group_info['id'], limit=members_limit)
         
@@ -83,10 +87,8 @@ async def cmd_analyze(message: Message):
             await message.answer("❌ Не удалось получить информацию об участниках группы.")
             return
         
-        # Анализируем аудиторию
         analysis = await analyzer.analyze_audience(members)
         
-        # Сохраняем результаты
         saved = await db.save_analysis(
             user_id=message.from_user.id,
             group_id=group_info['id'],
@@ -97,7 +99,6 @@ async def cmd_analyze(message: Message):
         if saved:
             logger.info(f"Анализ группы {group_info['name']} сохранен в БД")
         
-        # Формируем отчет
         report = f"📊 <b>Анализ аудитории: {group_info['name']}</b>\n\n"
         report += f"👥 Всего участников: {group_info['members_count']:,}\n"
         report += f"📈 Проанализировано: {len(members):,} ({min(100, len(members)*100//group_info['members_count'])}%)\n\n"
@@ -128,23 +129,32 @@ async def cmd_analyze(message: Message):
         
         await message.answer(report)
         
-        # Рекомендации для таргета
         if analysis.get('recommendations'):
             rec_text = "<b>🎯 Рекомендации для таргета:</b>\n"
             for i, rec in enumerate(analysis['recommendations'][:3], 1):
                 rec_text += f"{i}. {rec}\n"
             await message.answer(rec_text)
             
+    except KeyError as e:
+        logger.error(f"KeyError в обработке VK API: {e}", exc_info=True)
+        await message.answer(
+            "❌ <b>Ошибка формата данных от ВКонтакте</b>\n\n"
+            "Возможные причины:\n"
+            "• Группа не существует\n"
+            "• Неверный формат ссылки\n"
+            "• Проблемы с API ВКонтакте\n\n"
+            "Попробуйте команду /test_vk для проверки подключения"
+        )
     except Exception as e:
-        logger.error(f"Ошибка в команде /analyze: {e}", exc_info=True)
-        await message.answer("❌ Произошла внутренняя ошибка при анализе. Попробуйте позже.")
+        logger.error(f"Непредвиденная ошибка в /analyze: {e}", exc_info=True)
+        await message.answer("❌ Внутренняя ошибка при анализе. Попробуйте позже.")
 
 @dp.message(Command("compare"))
 async def cmd_compare(message: Message):
     try:
         args = message.text.split()[1:]
         if len(args) < 2:
-            await message.answer("❌ Укажите две ссылки на группы для сравнения\nНапример: <code>/compare https://vk.com/group1 https://vk.com/group2</code>")
+            await message.answer("❌ Укажите две ссылки на группы\nНапример: <code>/compare https://vk.com/group1 https://vk.com/group2</code>")
             return
         
         await message.answer("⏳ Сравниваю аудитории...")
@@ -168,7 +178,6 @@ async def cmd_compare(message: Message):
             await message.answer("❌ Не удалось получить данные одной из групп")
             return
         
-        # Сравниваем аудитории
         comparison = await analyzer.compare_audiences(
             groups_data[0]['analysis'],
             groups_data[1]['analysis']
@@ -215,66 +224,7 @@ async def cmd_stats(message: Message):
         logger.error(f"Ошибка в команде /stats: {e}")
         await message.answer("❌ Ошибка при получении статистики.")
 
-@dp.message(Command("help"))
-async def cmd_help(message: Message):
-    help_text = """
-<b>📚 Справка по использованию бота</b>
-
-<b>Основные команды:</b>
-<code>/analyze https://vk.com/groupname</code> - проанализировать аудиторию группы ВК
-
-<code>/compare ссылка1 ссылка2</code> - сравнить аудитории двух групп
-
-<code>/stats</code> - посмотреть вашу статистику
-
-<code>/help</code> - показать эту справку
-
-<b>Примеры использования:</b>
-• Анализ группы: <code>/analyze https://vk.com/public123</code>
-• Сравнение групп: <code>/compare https://vk.com/group1 https://vk.com/group2</code>
-
-<b>Что анализирует бот:</b>
-✅ Демография (пол, возраст)
-✅ География (города)
-✅ Интересы и активность
-✅ Рекомендации для таргетированной рекламы
-
-<b>Ограничения:</b>
-⚠️ Доступны только открытые группы
-⚠️ Анализируется до 1000 участников
-⚠️ Данные предоставляются "как есть"
-"""
-    await message.answer(help_text)
-
-async def main():
-    """Основная функция запуска бота"""
-    logger.info("Запуск Telegram бота для анализа аудитории ВК...")
-    
-    try:
-        # Инициализируем базу данных
-        logger.info("Инициализация базы данных...")
-        db_success = await db.init_db()
-        
-        if db_success:
-            logger.info("Бот готов к работе!")
-        else:
-            logger.warning("Бот запущен с временной SQLite базой. Данные не будут сохранены после перезапуска!")
-        
-        # Запускаем бота
-        logger.info(f"Бот @{(await bot.get_me()).username} запущен")
-        await dp.start_polling(bot)
-        
-    except Exception as e:
-        logger.critical(f"Критическая ошибка при запуске бота: {e}", exc_info=True)
-        raise
-        
-    finally:
-        # Корректное завершение работы
-        logger.info("Завершение работы бота...")
-        await db.close()
-        await vk_client.close()
-        logger.info("Бот остановлен")
-        @dp.message(Command("test_vk"))
+@dp.message(Command("test_vk"))
 async def cmd_test_vk(message: Message):
     """Тестирование подключения к VK API"""
     if message.from_user.id not in config.ADMIN_IDS:
@@ -305,6 +255,62 @@ async def cmd_test_vk(message: Message):
     except Exception as e:
         logger.error(f"Ошибка тестирования VK: {e}", exc_info=True)
         await message.answer(f"❌ Ошибка при тестировании: {str(e)}")
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    help_text = """
+<b>📚 Справка по использованию бота</b>
+
+<b>Основные команды:</b>
+<code>/analyze ссылка_на_группу</code> - анализ аудитории
+<code>/compare ссылка1 ссылка2</code> - сравнение двух групп
+<code>/stats</code> - ваша статистика
+<code>/test_vk</code> - тест подключения к VK (админы)
+<code>/help</code> - эта справка
+
+<b>Форматы ссылок:</b>
+• <code>https://vk.com/public123456</code>
+• <code>https://vk.com/club123456</code>
+• <code>https://vk.com/название_группы</code>
+• <code>vk.com/groupname</code>
+• <code>@groupname</code>
+
+<b>Примеры:</b>
+<code>/analyze https://vk.com/durov</code>
+<code>/analyze vk.com/club1</code>
+<code>/compare vk.com/group1 vk.com/group2</code>
+
+<b>Ограничения:</b>
+• Только открытые группы ВК
+• До 1000 участников за анализ
+• Лимиты VK API (~3 запроса/сек)
+"""
+    await message.answer(help_text)
+
+async def main():
+    logger.info("Запуск Telegram бота для анализа аудитории ВК...")
+    
+    try:
+        logger.info("Инициализация базы данных...")
+        db_success = await db.init_db()
+        
+        if db_success:
+            logger.info("Бот готов к работе!")
+        else:
+            logger.warning("Бот запущен с временной SQLite базой")
+        
+        logger.info(f"Бот @{(await bot.get_me()).username} запущен")
+        await dp.start_polling(bot)
+        
+    except Exception as e:
+        logger.critical(f"Критическая ошибка при запуске бота: {e}", exc_info=True)
+        raise
+        
+    finally:
+        logger.info("Завершение работы бота...")
+        await db.close()
+        await vk_client.close()
+        logger.info("Бот остановлен")
 
 if __name__ == "__main__":
     asyncio.run(main())
