@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
-from sqlalchemy import Column, Integer, String, JSON, DateTime, Text, select
+from sqlalchemy import Column, Integer, String, JSON, DateTime, select
 import sqlalchemy
 
 from config import config
@@ -35,19 +35,16 @@ class Database:
         self.async_session = None
     
     def _normalize_db_url(self, db_url: str) -> str:
-        """Нормализация URL базы данных для SQLAlchemy"""
         if not db_url:
             logger.warning("DATABASE_URL пустой, используется SQLite")
             return "sqlite+aiosqlite:///database.db"
         
-        # Railway часто использует postgres:// вместо postgresql://
         if db_url.startswith("postgres://"):
             db_url = db_url.replace("postgres://", "postgresql+asyncpg://", 1)
             logger.info("Конвертирован postgres:// в postgresql+asyncpg://")
         elif db_url.startswith("postgresql://"):
             db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
         
-        # Если URL указывает на localhost, используем SQLite для Railway
         if "localhost" in db_url or "127.0.0.1" in db_url or "::1" in db_url:
             logger.warning(f"Обнаружен localhost в DATABASE_URL, используется SQLite")
             return "sqlite+aiosqlite:///database.db"
@@ -55,7 +52,6 @@ class Database:
         return db_url
     
     async def init_db(self) -> bool:
-        """Инициализация подключения к базе данных"""
         try:
             db_url = self._normalize_db_url(config.DATABASE_URL)
             logger.info(f"Инициализация БД с URL: {db_url[:50]}...")
@@ -74,11 +70,9 @@ class Database:
                 expire_on_commit=False
             )
             
-            # Создание таблиц
             async with self.engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
             
-            # Тестовое подключение
             async with self.async_session() as session:
                 await session.execute(select(1))
             
@@ -87,8 +81,7 @@ class Database:
             
         except Exception as e:
             logger.error(f"Ошибка инициализации базы данных: {e}")
-            # В случае ошибки создаем in-memory SQLite для продолжения работы
-            logger.info("Создается in-memory SQLite база для продолжения работы")
+            logger.info("Создается in-memory SQLite база")
             self.engine = create_async_engine(
                 "sqlite+aiosqlite:///:memory:",
                 echo=False
@@ -106,7 +99,6 @@ class Database:
     
     async def save_analysis(self, user_id: int, group_id: str, 
                            group_name: str, analysis: Dict[str, Any]) -> bool:
-        """Сохранение результата анализа в базу данных"""
         try:
             async with self.async_session() as session:
                 analysis_record = AnalysisResult(
@@ -117,7 +109,6 @@ class Database:
                 )
                 session.add(analysis_record)
                 
-                # Обновление статистики пользователя
                 stats = await session.get(UserStats, user_id)
                 if not stats:
                     stats = UserStats(user_id=user_id)
@@ -134,7 +125,6 @@ class Database:
             return False
     
     async def get_user_stats(self, user_id: int) -> Dict[str, Any]:
-        """Получение статистики пользователя"""
         try:
             async with self.async_session() as session:
                 stats = await session.get(UserStats, user_id)
@@ -146,7 +136,6 @@ class Database:
                         'last_analyses': []
                     }
                 
-                # Получение последних анализов
                 query = select(AnalysisResult).where(
                     AnalysisResult.user_id == user_id
                 ).order_by(
@@ -172,7 +161,6 @@ class Database:
             return {'total_analyses': 0, 'saved_reports': 0, 'last_analyses': []}
     
     async def close(self):
-        """Корректное закрытие соединений с базой данных"""
         if self.engine:
             await self.engine.dispose()
             logger.info("Соединения с базой данных закрыты")
