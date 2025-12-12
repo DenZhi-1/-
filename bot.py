@@ -1,29 +1,28 @@
 import asyncio
 import logging
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.enums import ParseMode
-import os
-import sys
 
-# Правильный импорт config
 from config import config
-from vk_api_client import VKAPIClient
+from vk_api_client import vk_client
 from analytics import AudienceAnalyzer
 from database import Database
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Создаем экземпляры
-bot = Bot(token=config.TELEGRAM_BOT_TOKEN, parse_mode=ParseMode.HTML)
+# Инициализация бота с новым синтаксисом aiogram 3.7.0+
+bot = Bot(
+    token=config.TELEGRAM_BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 dp = Dispatcher()
 db = Database()
-vk_client = VKAPIClient()
 analyzer = AudienceAnalyzer()
 
-# Команда /start
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
@@ -35,7 +34,6 @@ async def cmd_start(message: Message):
         "/help - справка по использованию"
     )
 
-# Команда /analyze
 @dp.message(Command("analyze"))
 async def cmd_analyze(message: Message):
     try:
@@ -97,10 +95,9 @@ async def cmd_analyze(message: Message):
             await message.answer(rec_text)
             
     except Exception as e:
-        logger.error(f"Analysis error: {e}")
+        logger.error(f"Ошибка анализа: {e}")
         await message.answer("❌ Произошла ошибка при анализе")
 
-# Команда /compare
 @dp.message(Command("compare"))
 async def cmd_compare(message: Message):
     try:
@@ -145,10 +142,9 @@ async def cmd_compare(message: Message):
         await message.answer(report)
         
     except Exception as e:
-        logger.error(f"Compare error: {e}")
+        logger.error(f"Ошибка сравнения: {e}")
         await message.answer("❌ Ошибка при сравнении")
 
-# Команда /stats
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
     try:
@@ -165,10 +161,9 @@ async def cmd_stats(message: Message):
         
         await message.answer(report)
     except Exception as e:
-        logger.error(f"Stats error: {e}")
+        logger.error(f"Ошибка статистики: {e}")
         await message.answer("❌ Ошибка при получении статистики")
 
-# Команда /help
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     help_text = """
@@ -179,8 +174,6 @@ async def cmd_help(message: Message):
 <code>/compare ссылка1 ссылка2</code> - сравнить две аудитории
 
 <code>/stats</code> - ваша статистика
-
-<code>/export</code> - экспорт данных (CSV)
 
 <b>Примеры использования:</b>
 • Анализ конкурента: <code>/analyze https://vk.com/competitor</code>
@@ -194,13 +187,15 @@ async def cmd_help(message: Message):
 """
     await message.answer(help_text)
 
-# Основная функция
 async def main():
     try:
+        # Инициализируем базу данных
         await db.init_db()
+        
+        # Запускаем бота
         await dp.start_polling(bot)
     except Exception as e:
-        logger.error(f"Bot error: {e}")
+        logger.error(f"Критическая ошибка: {e}")
     finally:
         # Закрываем сессию VK клиента при завершении
         await vk_client.close()
