@@ -1,6 +1,8 @@
 import logging
+import json
 from datetime import datetime
 from typing import Dict, List, Optional, Any
+import asyncpg
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy import Column, Integer, String, JSON, DateTime, select, text
@@ -9,6 +11,8 @@ import sqlalchemy
 from config import config
 
 logger = logging.getLogger(__name__)
+
+# SQLAlchemy модели (для совместимости)
 Base = declarative_base()
 
 class AnalysisResult(Base):
@@ -16,13 +20,10 @@ class AnalysisResult(Base):
     
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, index=True)
-    group_id = Column(String, index=True)  # String для VK ID
+    group_id = Column(String, index=True)
     group_name = Column(String)
     analysis_data = Column(JSON)
     created_at = Column(DateTime, default=datetime.utcnow)
-    
-    def __repr__(self):
-        return f"<AnalysisResult(user_id={self.user_id}, group_id={self.group_id})>"
 
 class UserStats(Base):
     __tablename__ = 'user_stats'
@@ -36,8 +37,11 @@ class Database:
     def __init__(self):
         self.engine = None
         self.async_session = None
+        self.pool = None  # Пул соединений asyncpg
+        self.db_url = None
     
     def _normalize_db_url(self, db_url: str) -> str:
+        """Нормализация URL базы данных"""
         if not db_url:
             logger.warning("DATABASE_URL пустой, используется SQLite")
             return "sqlite+aiosqlite:///database.db"
@@ -45,90 +49,159 @@ class Database:
         if db_url.startswith("postgres://"):
             db_url = db_url.replace("postgres://", "postgresql+asyncpg://", 1)
             logger.info("Конвертирован postgres:// в postgresql+asyncpg://")
-        elif db_url.startswith("postgresql://"):
-            db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
         
-        if "localhost" in db_url or "127.0.0.1" in db_url or "::1" in db_url:
-            logger.warning(f"Обнаружен localhost в DATABASE_URL, используется SQLite")
-            return "sqlite+aiosqlite:///database.db"
-        
+        self.db_url = db_url
         return db_url
     
     async def init_db(self) -> bool:
+        """Инициализация базы данных"""
         try:
             db_url = self._normalize_db_url(config.DATABASE_URL)
             logger.info(f"Инициализация БД с URL: {db_url[:50]}...")
             
-            self.engine = create_async_engine(
-                db_url,
-                echo=False,
-                pool_size=10,
-                max_overflow=20,
-                pool_pre_ping=True
-            )
-            
-            self.async_session = sessionmaker(
-                self.engine,
-                class_=AsyncSession,
-                expire_on_commit=False
-            )
-            
-            async with self.engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
-            
-            async with self.async_session() as session:
-                await session.execute(select(1))
-            
-            logger.info("✅ База данных успешно инициализирована")
-            return True
-            
+            # Для PostgreSQL создаем пул соединений asyncpg
+            if "postgresql" in db_url:
+                # Извлекаем DSN для asyncpg
+                dsn = db_url.replace("postgresql+asyncpg://", "postgresql://")
+                
+                # Создаем пул соединений
+                self.pool = await asyncpg.create_pool(
+                    dsn=dsn,
+                    min_size=1,
+                    max_size=10,
+                    command_timeout=60
+                )
+                
+                # Проверяем соединение
+                async with self.pool.acquire() as conn:
+                    await conn.execute("SELECT 1")
+                
+                logger.info("✅ Пул соединений PostgreSQL создан")
+                
+                # Также инициализируем SQLAlchemy для совместимости
+                self.engine = create_async_engine(db_url, echo=False)
+                self.async_session = sessionmaker(
+                    self.engine, 
+                    class_=AsyncSession,
+                    expire_on_commit=False
+                )
+                
+                # Создаем таблицы через SQLAlchemy
+                async with self.engine.begin() as conn:
+                    await conn.run_sync(Base.metadata.create_all)
+                
+                logger.info("✅ База данных PostgreSQL инициализирована")
+                return True
+                
+            else:
+                # SQLite
+                self.engine = create_async_engine(db_url, echo=False)
+                self.async_session = sessionmaker(
+                    self.engine, 
+                    class_=AsyncSession,
+                    expire_on_commit=False
+                )
+                
+                async with self.engine.begin() as conn:
+                    await conn.run_sync(Base.metadata.create_all)
+                
+                logger.info("✅ SQLite база данных инициализирована")
+                return True
+                
         except Exception as e:
             logger.error(f"❌ Ошибка инициализации базы данных: {e}")
-            logger.info("Создается in-memory SQLite база")
-            self.engine = create_async_engine(
-                "sqlite+aiosqlite:///:memory:",
-                echo=False
-            )
-            self.async_session = sessionmaker(
-                self.engine,
-                class_=AsyncSession,
-                expire_on_commit=False
-            )
             
-            async with self.engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
-            
-            return False
+            # Fallback на in-memory SQLite
+            try:
+                logger.info("Создается in-memory SQLite база")
+                self.engine = create_async_engine(
+                    "sqlite+aiosqlite:///:memory:",
+                    echo=False
+                )
+                self.async_session = sessionmaker(
+                    self.engine,
+                    class_=AsyncSession,
+                    expire_on_commit=False
+                )
+                
+                async with self.engine.begin() as conn:
+                    await conn.run_sync(Base.metadata.create_all)
+                
+                logger.info("✅ In-memory SQLite база создана")
+                return True
+            except Exception as sqlite_error:
+                logger.error(f"❌ Ошибка создания SQLite базы: {sqlite_error}")
+                return False
     
-    async def save_analysis(self, user_id: int, group_id: str, 
+    async def save_analysis(self, user_id: int, group_id: int, 
                            group_name: str, analysis: Dict[str, Any]) -> bool:
         """
-        Сохраняет результат анализа в базу данных
+        Сохраняет результат анализа (основной метод)
         
-        Args:
-            user_id: ID пользователя Telegram
-            group_id: ID группы ВК (должен быть строкой)
-            group_name: Название группы
-            analysis: Данные анализа
-            
-        Returns:
-            bool: Успешно ли сохранено
+        ВАЖНО: group_id принимается как int, но сохраняется как VARCHAR
         """
         try:
-            async with self.async_session() as session:
-                # Убедимся, что group_id - строка
-                group_id_str = str(group_id) if not isinstance(group_id, str) else group_id
+            # Преобразуем group_id в строку
+            group_id_str = str(group_id)
+            
+            # Если есть пул PostgreSQL, используем его
+            if self.pool:
+                return await self._save_analysis_postgresql(
+                    user_id, group_id_str, group_name, analysis
+                )
+            else:
+                # Используем SQLAlchemy
+                return await self._save_analysis_sqlalchemy(
+                    user_id, group_id_str, group_name, analysis
+                )
                 
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения анализа: {e}", exc_info=True)
+            return False
+    
+    async def _save_analysis_postgresql(self, user_id: int, group_id: str, 
+                                       group_name: str, analysis: Dict[str, Any]) -> bool:
+        """Сохранение через asyncpg (PostgreSQL)"""
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.transaction():
+                    # Сохраняем анализ
+                    await conn.execute("""
+                        INSERT INTO analyses (user_id, group_id, group_name, analysis_data, created_at)
+                        VALUES ($1, $2, $3, $4, $5)
+                    """, user_id, group_id, group_name[:255], json.dumps(analysis), datetime.utcnow())
+                    
+                    # Обновляем статистику
+                    await conn.execute("""
+                        INSERT INTO user_stats (user_id, total_analyses, last_activity)
+                        VALUES ($1, 1, $2)
+                        ON CONFLICT (user_id) DO UPDATE SET
+                        total_analyses = user_stats.total_analyses + 1,
+                        last_activity = $2
+                    """, user_id, datetime.utcnow())
+                
+                logger.info(f"✅ Анализ сохранен (PostgreSQL): user_id={user_id}, group_id={group_id}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения в PostgreSQL: {e}", exc_info=True)
+            return False
+    
+    async def _save_analysis_sqlalchemy(self, user_id: int, group_id: str, 
+                                       group_name: str, analysis: Dict[str, Any]) -> bool:
+        """Сохранение через SQLAlchemy (SQLite)"""
+        try:
+            async with self.async_session() as session:
                 analysis_record = AnalysisResult(
                     user_id=user_id,
-                    group_id=group_id_str,  # Всегда строка
-                    group_name=group_name[:255],  # Ограничиваем длину
+                    group_id=group_id,
+                    group_name=group_name[:255],
                     analysis_data=analysis,
                     created_at=datetime.utcnow()
                 )
                 session.add(analysis_record)
                 
-                # Обновляем статистику пользователя
+                # Обновляем статистику
                 stats = await session.get(UserStats, user_id)
                 if not stats:
                     stats = UserStats(user_id=user_id)
@@ -138,75 +211,80 @@ class Database:
                 stats.last_activity = datetime.utcnow()
                 
                 await session.commit()
-                logger.info(f"✅ Анализ сохранен: user_id={user_id}, group_id={group_id_str}")
-                return True
-                
-        except sqlalchemy.exc.IntegrityError as e:
-            logger.error(f"❌ Ошибка целостности данных при сохранении анализа: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"❌ Ошибка сохранения анализа: {e}", exc_info=True)
-            
-            # Пробуем альтернативный метод сохранения
-            try:
-                return await self._save_analysis_raw(user_id, group_id, group_name, analysis)
-            except Exception as e2:
-                logger.error(f"❌ Альтернативный метод также не сработал: {e2}")
-                return False
-    
-    async def _save_analysis_raw(self, user_id: int, group_id: str, 
-                                group_name: str, analysis: Dict[str, Any]) -> bool:
-        """Альтернативный метод сохранения через сырой SQL"""
-        try:
-            async with self.async_session() as session:
-                # Используем сырой SQL с явным приведением типов
-                group_id_str = str(group_id) if not isinstance(group_id, str) else group_id
-                
-                # Для PostgreSQL используем явное приведение типов
-                if "postgresql" in str(self.engine.url):
-                    query = text("""
-                        INSERT INTO analyses (user_id, group_id, group_name, analysis_data, created_at)
-                        VALUES (:user_id, :group_id::VARCHAR, :group_name, :analysis_data, :created_at)
-                    """)
-                else:
-                    # Для SQLite
-                    query = text("""
-                        INSERT INTO analyses (user_id, group_id, group_name, analysis_data, created_at)
-                        VALUES (:user_id, :group_id, :group_name, :analysis_data, :created_at)
-                    """)
-                
-                await session.execute(query, {
-                    'user_id': user_id,
-                    'group_id': group_id_str,
-                    'group_name': group_name[:255],
-                    'analysis_data': analysis,
-                    'created_at': datetime.utcnow()
-                })
-                
-                # Обновляем статистику
-                stats_query = text("""
-                    INSERT INTO user_stats (user_id, total_analyses, last_activity)
-                    VALUES (:user_id, 1, :now)
-                    ON CONFLICT (user_id) DO UPDATE SET
-                    total_analyses = user_stats.total_analyses + 1,
-                    last_activity = :now
-                """)
-                
-                await session.execute(stats_query, {
-                    'user_id': user_id,
-                    'now': datetime.utcnow()
-                })
-                
-                await session.commit()
-                logger.info(f"✅ Анализ сохранен (raw SQL): user_id={user_id}, group_id={group_id_str}")
+                logger.info(f"✅ Анализ сохранен (SQLAlchemy): user_id={user_id}, group_id={group_id}")
                 return True
                 
         except Exception as e:
-            logger.error(f"❌ Ошибка сохранения анализа (raw SQL): {e}", exc_info=True)
+            logger.error(f"❌ Ошибка сохранения через SQLAlchemy: {e}", exc_info=True)
             return False
     
     async def get_user_stats(self, user_id: int) -> Dict[str, Any]:
         """Получает статистику пользователя"""
+        try:
+            if self.pool:
+                # PostgreSQL через asyncpg
+                return await self._get_user_stats_postgresql(user_id)
+            else:
+                # SQLite через SQLAlchemy
+                return await self._get_user_stats_sqlalchemy(user_id)
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения статистики: {e}")
+            return {
+                'total_analyses': 0,
+                'saved_reports': 0,
+                'last_analyses': []
+            }
+    
+    async def _get_user_stats_postgresql(self, user_id: int) -> Dict[str, Any]:
+        """Получение статистики через asyncpg"""
+        try:
+            async with self.pool.acquire() as conn:
+                # Получаем статистику пользователя
+                stats = await conn.fetchrow("""
+                    SELECT total_analyses, saved_reports
+                    FROM user_stats
+                    WHERE user_id = $1
+                """, user_id)
+                
+                if not stats:
+                    return {
+                        'total_analyses': 0,
+                        'saved_reports': 0,
+                        'last_analyses': []
+                    }
+                
+                # Получаем последние анализы
+                last_analyses = await conn.fetch("""
+                    SELECT group_name, created_at, group_id
+                    FROM analyses
+                    WHERE user_id = $1
+                    ORDER BY created_at DESC
+                    LIMIT 5
+                """, user_id)
+                
+                return {
+                    'total_analyses': stats['total_analyses'],
+                    'saved_reports': stats['saved_reports'],
+                    'last_analyses': [
+                        {
+                            'group_name': a['group_name'],
+                            'created_at': a['created_at'].strftime('%d.%m.%Y %H:%M'),
+                            'group_id': a['group_id']
+                        } for a in last_analyses
+                    ]
+                }
+                
+        except Exception as e:
+            logger.error(f"Ошибка получения статистики PostgreSQL: {e}")
+            return {
+                'total_analyses': 0,
+                'saved_reports': 0,
+                'last_analyses': []
+            }
+    
+    async def _get_user_stats_sqlalchemy(self, user_id: int) -> Dict[str, Any]:
+        """Получение статистики через SQLAlchemy"""
         try:
             async with self.async_session() as session:
                 stats = await session.get(UserStats, user_id)
@@ -241,7 +319,7 @@ class Database:
                 }
                 
         except Exception as e:
-            logger.error(f"❌ Ошибка получения статистики: {e}")
+            logger.error(f"Ошибка получения статистики SQLAlchemy: {e}")
             return {
                 'total_analyses': 0,
                 'saved_reports': 0,
@@ -251,59 +329,34 @@ class Database:
     async def get_analyses_count(self, user_id: int) -> int:
         """Получает количество анализов пользователя"""
         try:
-            async with self.async_session() as session:
-                query = select(sqlalchemy.func.count(AnalysisResult.id)).where(
-                    AnalysisResult.user_id == user_id
-                )
-                result = await session.execute(query)
-                return result.scalar() or 0
+            if self.pool:
+                async with self.pool.acquire() as conn:
+                    count = await conn.fetchval("""
+                        SELECT COUNT(*) FROM analyses WHERE user_id = $1
+                    """, user_id)
+                    return count or 0
+            else:
+                async with self.async_session() as session:
+                    query = select(sqlalchemy.func.count(AnalysisResult.id)).where(
+                        AnalysisResult.user_id == user_id
+                    )
+                    result = await session.execute(query)
+                    return result.scalar() or 0
         except Exception as e:
             logger.error(f"Ошибка получения количества анализов: {e}")
             return 0
     
-    async def get_recent_analyses(self, user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
-        """Получает последние анализы пользователя"""
-        try:
-            async with self.async_session() as session:
-                query = select(AnalysisResult).where(
-                    AnalysisResult.user_id == user_id
-                ).order_by(
-                    AnalysisResult.created_at.desc()
-                ).limit(limit)
-                
-                result = await session.execute(query)
-                analyses = result.scalars().all()
-                
-                return [
-                    {
-                        'id': a.id,
-                        'group_id': a.group_id,
-                        'group_name': a.group_name,
-                        'created_at': a.created_at,
-                        'has_data': bool(a.analysis_data)
-                    } for a in analyses
-                ]
-        except Exception as e:
-            logger.error(f"Ошибка получения последних анализов: {e}")
-            return []
-    
-    async def get_analysis_by_id(self, analysis_id: int) -> Optional[AnalysisResult]:
-        """Получает анализ по ID"""
-        try:
-            async with self.async_session() as session:
-                query = select(AnalysisResult).where(AnalysisResult.id == analysis_id)
-                result = await session.execute(query)
-                return result.scalar_one_or_none()
-        except Exception as e:
-            logger.error(f"Ошибка получения анализа по ID: {e}")
-            return None
-    
     async def close(self):
         """Закрывает соединения с базой данных"""
         try:
+            if self.pool:
+                await self.pool.close()
+                logger.info("✅ Пул соединений PostgreSQL закрыт")
+            
             if self.engine:
                 await self.engine.dispose()
-                logger.info("✅ Соединения с базой данных закрыты")
+                logger.info("✅ Соединения SQLAlchemy закрыты")
+                
         except Exception as e:
             logger.error(f"Ошибка при закрытии соединений с БД: {e}")
 
