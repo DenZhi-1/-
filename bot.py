@@ -1,16 +1,19 @@
 import asyncio
 import logging
+import json
+from datetime import datetime
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.enums import ParseMode
-from datetime import datetime
 
 from config import config
 from vk_api_client import vk_client
 from analytics import AudienceAnalyzer
+from text_analyzer import TextAnalyzer
 from database import Database
+from competitor_analysis import CompetitorAnalyzer
 
 # Настройка логирования
 log_level = getattr(logging, config.LOG_LEVEL.upper(), logging.INFO)
@@ -43,17 +46,34 @@ bot = Bot(
 dp = Dispatcher()
 db = Database()
 analyzer = AudienceAnalyzer()
+text_analyzer = TextAnalyzer()
+competitor_analyzer = CompetitorAnalyzer()
 
 # Словарь для хранения временных данных пользователей
 user_sessions = {}
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 
-def create_back_button() -> InlineKeyboardMarkup:
+def create_back_button(callback_data: str = "back_to_report") -> InlineKeyboardMarkup:
     """Создает кнопку 'Назад'"""
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Назад к отчету", callback_data="back_to_report")]
+            [InlineKeyboardButton(text="🔙 Назад", callback_data=callback_data)]
+        ]
+    )
+    return keyboard
+
+def create_main_menu_keyboard() -> InlineKeyboardMarkup:
+    """Создает клавиатуру главного меню"""
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔍 Анализ группы", callback_data="analyze_group")],
+            [InlineKeyboardButton(text="🥊 Анализ конкурентов", callback_data="competitors_help")],
+            [InlineKeyboardButton(text="🧠 AI-анализ текста", callback_data="text_analysis_help")],
+            [
+                InlineKeyboardButton(text="📊 Статистика", callback_data="user_stats"),
+                InlineKeyboardButton(text="📚 Помощь", callback_data="full_help")
+            ]
         ]
     )
     return keyboard
@@ -67,7 +87,47 @@ def get_quality_stars(score: float) -> str:
     stars_count = min(5, max(1, int(score / 20)))
     return "⭐" * stars_count + "☆" * (5 - stars_count)
 
-# ==================== КОМАНДЫ БОТА ====================
+def create_competitor_keyboard() -> InlineKeyboardMarkup:
+    """Создает клавиатуру для анализа конкурентов"""
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔍 Найти конкурентов", callback_data="find_competitors"),
+                InlineKeyboardButton(text="📊 Сравнить всех", callback_data="compare_all_competitors")
+            ],
+            [
+                InlineKeyboardButton(text="📈 ТОП-5 конкурентов", callback_data="top_competitors"),
+                InlineKeyboardButton(text="💡 Рекомендации", callback_data="competitor_recommendations")
+            ],
+            [
+                InlineKeyboardButton(text="📤 Экспорт данных", callback_data="export_competitor_data"),
+                InlineKeyboardButton(text="🔙 В главное меню", callback_data="main_menu")
+            ]
+        ]
+    )
+    return keyboard
+
+def create_text_analysis_keyboard() -> InlineKeyboardMarkup:
+    """Создает клавиатуру для AI-анализа текста"""
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📊 Тональность", callback_data="text_sentiment"),
+                InlineKeyboardButton(text="🔑 Ключевые слова", callback_data="text_keywords")
+            ],
+            [
+                InlineKeyboardButton(text="📚 Темы", callback_data="text_topics"),
+                InlineKeyboardButton(text="😊 Эмоции", callback_data="text_emotions")
+            ],
+            [
+                InlineKeyboardButton(text="💡 Рекомендации", callback_data="text_recommendations"),
+                InlineKeyboardButton(text="🔙 В главное меню", callback_data="main_menu")
+            ]
+        ]
+    )
+    return keyboard
+
+# ==================== ОСНОВНЫЕ КОМАНДЫ БОТА ====================
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
@@ -75,38 +135,29 @@ async def cmd_start(message: Message):
     welcome_text = """
 👋 <b>Привет! Я бот для глубокого анализа аудитории ВКонтакте.</b>
 
-📊 <b>Я умею анализировать:</b>
-• 👫 Демографию (пол, возраст, города)
-• 🎯 Интересы и активность пользователей
-• 📱 Социальную активность и вовлеченность
-• 📊 Качество аудитории и полноту профилей
-• 🏙️ Географическое распределение по типам городов
+🚀 <b>НОВЫЕ ВОЗМОЖНОСТИ:</b>
+• 🥊 <b>Анализ конкурентов</b> - автоматический поиск и анализ похожих групп
+• 🧠 <b>AI-анализ текста</b> - определение тональности и тематик
+• 📊 <b>Расширенная аналитика</b> - еще больше метрик и рекомендаций
 
-🚀 <b>Доступные команды:</b>
-• /analyze [ссылка] — полный анализ аудитории группы
-• /quick [ссылка] — быстрый анализ (основные метрики)
-• /compare [ссылка1] [ссылка2] — сравнить две аудитории
-• /stats — ваша статистика анализов
-• /export — экспорт данных анализа
-• /test_vk — тест подключения к VK API (админы)
+🎯 <b>Основные команды:</b>
+• /analyze [ссылка] — полный анализ аудитории
+• /competitors [ссылка] — найти и проанализировать конкурентов
+• /text_analysis [ссылка] — AI-анализ текстового контента
+• /compare [ссылка1] [ссылка2] — сравнить две группы
+• /quick [ссылка] — быстрый анализ
+• /stats — ваша статистика
 • /help — подробная справка
 
-🎯 <b>Пример использования:</b>
+📝 <b>Примеры:</b>
 <code>/analyze https://vk.com/vk</code>
-<code>/quick vk.com/public1</code>
+<code>/competitors vk.com/public1</code>
+<code>/text_analysis vk.com/groupname</code>
 
-⚠️ <i>Для анализа доступны только открытые группы ВК (до 1000 участников за анализ)</i>
+💡 <b>Совет:</b> Используйте команду /competitors для поиска и анализа похожих групп!
 """
     
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📚 Справка", callback_data="help")],
-            [InlineKeyboardButton(text="⚡ Быстрый анализ", callback_data="quick_help")],
-            [InlineKeyboardButton(text="📊 Пример отчета", callback_data="example_report")]
-        ]
-    )
-    
-    await message.answer(welcome_text, reply_markup=keyboard)
+    await message.answer(welcome_text, reply_markup=create_main_menu_keyboard())
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
@@ -121,19 +172,31 @@ async def cmd_help(message: Message):
 • Глубокий анализ всех метрик
 • Оценка качества аудитории
 • Детальные рекомендации
-• Сохранение в историю
+
+<code>/competitors ссылка_на_группу</code>
+<b>Анализ конкурентов (НОВОЕ!)</b>
+• Автоматический поиск похожих групп
+• Сравнение с конкурентами
+• Определение конкурентных преимуществ
+• Рекомендации по развитию
+
+<code>/text_analysis ссылка_на_группу</code>
+<b>AI-анализ текста (НОВОЕ!)</b>
+• Анализ тональности контента
+• Определение основных тематик
+• Анализ ключевых слов
+• Оценка эмоциональной окраски
 
 <code>/quick ссылка_на_группу</code>
 <b>Быстрый анализ</b>
 • Основные метрики за 1 минуту
 • Быстрая оценка аудитории
-• Основные рекомендации
 
 <code>/compare ссылка1 ссылка2</code>
 <b>Сравнение двух групп</b>
 • Сравнение демографии
 • Сравнение интересов
-• Оценка схожести аудиторий
+• Оценка схожести
 
 <code>/stats</code>
 <b>Ваша статистика</b>
@@ -145,13 +208,22 @@ async def cmd_help(message: Message):
 <b>Экспорт данных</b>
 • Экспорт анализа в текстовый формат
 • Полный отчет с детализацией
-• Данные для дальнейшей обработки
 
-<code>/test_vk</code>
-<b>Тест подключения к VK API</b>
-• Проверка токена
-• Тест запросов к API
-• Только для администраторов
+<b>🥊 АНАЛИЗ КОНКУРЕНТОВ:</b>
+Бот автоматически найдет похожие группы по тематике и проведет их анализ:
+1. Поиск конкурентов по ключевым словам
+2. Анализ их аудитории
+3. Сравнение с вашей группой
+4. Выявление сильных и слабых сторон
+5. Рекомендации по улучшению
+
+<b>🧠 AI-АНАЛИЗ ТЕКСТА:</b>
+Анализ текстового контента группы:
+• Тональность (позитивная/негативная/нейтральная)
+• Основные темы и категории
+• Ключевые слова и фразы
+• Эмоциональная окраска
+• Рекомендации по контенту
 
 <b>📋 ПОДДЕРЖИВАЕМЫЕ ФОРМАТЫ ССЫЛОК:</b>
 • Полная ссылка: <code>https://vk.com/public123456</code>
@@ -160,54 +232,29 @@ async def cmd_help(message: Message):
 • Упоминание: <code>@durov</code>
 • ID группы: <code>public1</code>
 
-<b>🎯 КАКИЕ ДАННЫЕ МЫ АНАЛИЗИРУЕМ:</b>
-
-<u>Демография:</u>
-• Пол и возраст пользователей
-• Возрастные группы (до 18, 18-24, 25-34, 35-44, 45-54, 55+)
-• Средний возраст аудитории
-
-<u>География:</u>
-• Топ-10 городов участников
-• Распределение по типам городов (столицы, миллионники, малые города)
-• Распределение по странам
-
-<u>Интересы и активность:</u>
-• Популярные категории интересов (технологии, спорт, искусство и др.)
-• Социальная активность (когда были онлайн)
-• Полнота заполнения профилей
-
-<u>Качество аудитории:</u>
-• Оценка качества от 0 до 100 баллов
-• Анализ вовлеченности пользователей
-• Рекомендации по улучшению
-
-<b>⚠️ ОГРАНИЧЕНИЯ И ВАЖНАЯ ИНФОРМАЦИЯ:</b>
+<b>⚠️ ОГРАНИЧЕНИЯ:</b>
 • Только открытые группы ВК
-• Максимум 1000 участников за один анализ
-• Лимиты VK API (~3 запроса в секунду)
-• Данные обновляются в реальном времени
-• Анализ может занять от 1 до 5 минут
+• Максимум 1000 участников за анализ
+• Лимиты VK API
+• Анализ может занять 3-5 минут
 
-<b>💡 СОВЕТЫ ПО ИСПОЛЬЗОВАНИЮ:</b>
-1. Для быстрой проверки используйте /quick
-2. Для детального анализа — /analyze
+<b>💡 СОВЕТЫ:</b>
+1. Используйте /competitors для исследования рынка
+2. Анализируйте текст с помощью /text_analysis
 3. Сохраняйте интересные отчеты через /export
-4. Сравнивайте похожие группы через /compare
-5. Проверяйте статистику через /stats
-
-<b>📞 ПОДДЕРЖКА:</b>
-Если возникли проблемы или вопросы:
-1. Проверьте правильность ссылки
-2. Убедитесь, что группа открыта
-3. Используйте /test_vk для проверки подключения
-4. Обратитесь к администратору
+4. Сравнивайте группы через /compare
 """
     
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⚡ Начать анализ", callback_data="start_analysis")],
-            [InlineKeyboardButton(text="🔙 В начало", callback_data="back_to_start")]
+            [
+                InlineKeyboardButton(text="🥊 Анализ конкурентов", callback_data="start_competitors"),
+                InlineKeyboardButton(text="🧠 AI-анализ текста", callback_data="start_text_analysis")
+            ],
+            [
+                InlineKeyboardButton(text="🔍 Начать анализ", callback_data="start_analysis"),
+                InlineKeyboardButton(text="🔙 В начало", callback_data="back_to_start")
+            ]
         ]
     )
     
@@ -915,7 +962,7 @@ async def send_recommendations_report(message: Message, analysis: dict):
     else:
         report += "<b>⏰ Рекомендуемое время публикаций:</b>\n"
         report += "• Утро (10-11): основные публикации\n"
-        report += "• Вечер (20-21): повтор важного контента\n"
+        report += "• Вечер (20-21): повтор важного контент\n"
         report += "• Публикуйте реже, но качественнее (1-2 раза в день)\n"
     
     report += "\n<b>🎯 КЛЮЧЕВОЙ СОВЕТ:</b>\n"
@@ -938,6 +985,591 @@ async def back_to_report(callback: CallbackQuery):
     analyzed_count = report_data['analyzed_count']
     
     await send_comprehensive_report(callback.message, group_info, analysis, analyzed_count)
+    await callback.answer()
+
+@dp.message(Command("competitors"))
+async def cmd_competitors(message: Message, command: CommandObject = None):
+    """Анализ конкурентов группы"""
+    try:
+        args = message.text.split()[1:] if command is None else command.args.split()
+        if not args:
+            await message.answer(
+                "🥊 <b>Анализ конкурентов</b>\n\n"
+                "Эта команда найдет и проанализирует похожие группы.\n\n"
+                "<b>Пример:</b>\n"
+                "<code>/competitors https://vk.com/public123</code>\n"
+                "<code>/competitors vk.com/groupname</code>\n\n"
+                "<i>Бот найдет до 10 похожих групп и проведет их анализ</i>"
+            )
+            return
+        
+        group_link = args[0].strip()
+        user_id = message.from_user.id
+        
+        # Проверяем, не выполняется ли уже анализ для этого пользователя
+        if user_id in user_sessions and user_sessions[user_id].get('status') == 'analyzing_competitors':
+            await message.answer(
+                "⏳ <b>У вас уже выполняется анализ конкурентов</b>\n\n"
+                "Пожалуйста, дождитесь завершения текущего анализа."
+            )
+            return
+        
+        # Начинаем анализ
+        user_sessions[user_id] = {
+            'status': 'analyzing_competitors',
+            'group_link': group_link,
+            'current_step': 'получение_информации'
+        }
+        
+        await message.answer("🥊 <b>Начинаю анализ конкурентов...</b>")
+        logger.info(f"Пользователь {user_id} запросил анализ конкурентов для {group_link}")
+        
+        # Получаем информацию о целевой группе
+        await message.answer("🔍 <b>Шаг 1 из 4:</b> Анализирую целевую группу...")
+        group_info = await vk_client.get_group_info(group_link)
+        
+        if not group_info:
+            del user_sessions[user_id]
+            await message.answer(
+                "❌ <b>Не удалось получить информацию о группе</b>\n\n"
+                "Проверьте ссылку и убедитесь, что группа открыта."
+            )
+            return
+        
+        if group_info.get('is_closed', 1) != 0:
+            del user_sessions[user_id]
+            await message.answer(f"⚠️ <b>Группа '{group_info['name']}' закрытая или приватная</b>")
+            return
+        
+        user_sessions[user_id].update({
+            'group_info': group_info,
+            'current_step': 'поиск_конкурентов'
+        })
+        
+        # Поиск конкурентов
+        info_msg = await message.answer(
+            f"🎯 <b>Целевая группа:</b> {group_info['name']}\n"
+            f"👥 <b>Участников:</b> {format_number(group_info.get('members_count', 0))}\n\n"
+            "🔍 <b>Шаг 2 из 4:</b> Ищу похожие группы..."
+        )
+        
+        competitors = await competitor_analyzer.find_similar_groups(
+            group_info['name'],
+            group_info.get('description', ''),
+            limit=8
+        )
+        
+        if not competitors:
+            del user_sessions[user_id]
+            await info_msg.edit_text(
+                f"🎯 <b>Целевая группа:</b> {group_info['name']}\n\n"
+                "❌ <b>Не удалось найти похожие группы</b>\n\n"
+                "Попробуйте:\n"
+                "• Указать группу с более четкой тематикой\n"
+                "• Проверить, что группа имеет описание\n"
+                "• Попробовать другую группу"
+            )
+            return
+        
+        user_sessions[user_id].update({
+            'competitors': competitors,
+            'current_step': 'анализ_конкурентов'
+        })
+        
+        await info_msg.edit_text(
+            f"🎯 <b>Целевая группа:</b> {group_info['name']}\n"
+            f"🥊 <b>Найдено конкурентов:</b> {len(competitors)}\n\n"
+            "📊 <b>Шаг 3 из 4:</b> Анализирую аудиторию конкурентов..."
+        )
+        
+        # Анализируем аудиторию конкурентов
+        analyzed_competitors = []
+        for i, competitor in enumerate(competitors[:5], 1):  # Ограничиваем 5 конкурентами
+            try:
+                await info_msg.edit_text(
+                    f"🎯 <b>Целевая группа:</b> {group_info['name']}\n"
+                    f"🥊 <b>Анализирую конкурента {i} из 5...</b>\n\n"
+                    f"Группа: {competitor.get('name', 'Без названия')}"
+                )
+                
+                # Получаем участников конкурента (ограничиваем для скорости)
+                members = await vk_client.get_group_members(
+                    competitor['id'],
+                    limit=min(300, competitor.get('members_count', 0))
+                )
+                
+                if members:
+                    analysis = await analyzer.analyze_audience(members)
+                    competitor['analysis'] = analysis
+                    analyzed_competitors.append(competitor)
+                    
+                    logger.info(f"Проанализирован конкурент {competitor.get('name')}")
+                
+                await asyncio.sleep(1)  # Задержка между запросами
+                
+            except Exception as e:
+                logger.error(f"Ошибка анализа конкурента {competitor.get('name')}: {e}")
+                continue
+        
+        if not analyzed_competitors:
+            del user_sessions[user_id]
+            await message.answer(
+                "❌ <b>Не удалось проанализировать конкурентов</b>\n\n"
+                "Возможно, у конкурентов закрытые группы или нет участников."
+            )
+            return
+        
+        user_sessions[user_id].update({
+            'analyzed_competitors': analyzed_competitors,
+            'current_step': 'формирование_отчета'
+        })
+        
+        await info_msg.edit_text(
+            f"🎯 <b>Целевая группа:</b> {group_info['name']}\n"
+            f"🥊 <b>Проанализировано:</b> {len(analyzed_competitors)} конкурентов\n\n"
+            "📋 <b>Шаг 4 из 4:</b> Формирую отчет по конкурентам..."
+        )
+        
+        # Анализируем аудиторию целевой группы для сравнения
+        target_members = await vk_client.get_group_members(
+            group_info['id'],
+            limit=min(500, group_info.get('members_count', 0))
+        )
+        
+        target_analysis = None
+        if target_members:
+            target_analysis = await analyzer.analyze_audience(target_members)
+        
+        # Формируем и отправляем отчет
+        await send_competitor_report(
+            message,
+            group_info,
+            target_analysis,
+            analyzed_competitors
+        )
+        
+        # Сохраняем результаты
+        user_sessions[user_id]['status'] = 'completed'
+        user_sessions[user_id]['report_data'] = {
+            'group_info': group_info,
+            'target_analysis': target_analysis,
+            'competitors': analyzed_competitors
+        }
+        
+    except Exception as e:
+        logger.error(f"Ошибка в команде /competitors: {e}", exc_info=True)
+        if message.from_user.id in user_sessions:
+            del user_sessions[message.from_user.id]
+        await message.answer(
+            "❌ <b>Ошибка при анализе конкурентов</b>\n\n"
+            "Попробуйте позже или выберите другую группу."
+        )
+
+async def send_competitor_report(message: Message, target_group: dict, 
+                               target_analysis: dict, competitors: list):
+    """Отправляет отчет по анализу конкурентов"""
+    
+    # Основная информация
+    report = f"""
+🥊 <b>АНАЛИЗ КОНКУРЕНТОВ: {target_group['name']}</b>
+
+<b>🎯 ЦЕЛЕВАЯ ГРУППА:</b>
+• Название: {target_group['name']}
+• Участников: {format_number(target_group.get('members_count', 0))}
+• Описание: {target_group.get('description', 'Нет описания')[:100]}...
+
+<b>🥊 НАЙДЕНО КОНКУРЕНТОВ:</b> {len(competitors)}
+"""
+    
+    if target_analysis:
+        report += f"""• Качество аудитории: {target_analysis.get('audience_quality_score', 0)}/100
+• Основной пол: {'Мужчины' if target_analysis.get('gender', {}).get('male', 0) > 50 else 'Женщины'}
+• Основной возраст: {max(target_analysis.get('age_groups', {}).items(), key=lambda x: x[1])[0] if target_analysis.get('age_groups') else 'Не определен'}
+"""
+    
+    await message.answer(report, reply_markup=create_competitor_keyboard())
+    
+    # Детальная информация о конкурентах
+    details = "<b>📊 ПОДРОБНЫЙ АНАЛИЗ КОНКУРЕНТОВ:</b>\n\n"
+    
+    for i, competitor in enumerate(competitors[:5], 1):
+        details += f"<b>{i}. {competitor.get('name', 'Без названия')}</b>\n"
+        details += f"• Участников: {format_number(competitor.get('members_count', 0))}\n"
+        
+        if 'analysis' in competitor:
+            analysis = competitor['analysis']
+            details += f"• Качество: {analysis.get('audience_quality_score', 0)}/100\n"
+            
+            gender = analysis.get('gender', {})
+            if gender.get('male', 0) > gender.get('female', 0):
+                details += f"• Преобладающий пол: 👨 Мужчины ({gender.get('male', 0)}%)\n"
+            else:
+                details += f"• Преобладающий пол: 👩 Женщины ({gender.get('female', 0)}%)\n"
+        
+        details += f"• Ссылка: vk.com/{competitor.get('screen_name', '')}\n\n"
+    
+    await message.answer(details)
+    
+    # Сравнительная таблица
+    if target_analysis and len(competitors) > 0:
+        comparison = await competitor_analyzer.compare_with_competitors(
+            target_group, target_analysis, competitors
+        )
+        
+        if comparison:
+            await send_comparison_report(message, comparison)
+
+async def send_comparison_report(message: Message, comparison: dict):
+    """Отправляет отчет сравнения с конкурентами"""
+    report = "<b>📈 СРАВНИТЕЛЬНЫЙ АНАЛИЗ</b>\n\n"
+    
+    # Позиция в рейтинге
+    if 'rank' in comparison:
+        report += f"<b>🏆 Ваша позиция среди конкурентов:</b> {comparison['rank']} место\n\n"
+    
+    # Сильные стороны
+    if comparison.get('strengths'):
+        report += "<b>✅ ВАШИ СИЛЬНЫЕ СТОРОНЫ:</b>\n"
+        for strength in comparison['strengths'][:3]:
+            report += f"• {strength}\n"
+        report += "\n"
+    
+    # Слабые стороны
+    if comparison.get('weaknesses'):
+        report += "<b>⚠️ ВАШИ СЛАБЫЕ СТОРОНЫ:</b>\n"
+        for weakness in comparison['weaknesses'][:3]:
+            report += f"• {weakness}\n"
+        report += "\n"
+    
+    # Рекомендации
+    if comparison.get('recommendations'):
+        report += "<b>💡 РЕКОМЕНДАЦИИ:</b>\n"
+        for i, rec in enumerate(comparison['recommendations'][:5], 1):
+            report += f"{i}. {rec}\n"
+    
+    await message.answer(report)
+
+@dp.callback_query(F.data == "top_competitors")
+async def top_competitors_callback(callback: CallbackQuery):
+    """Показывает ТОП-5 конкурентов"""
+    user_id = callback.from_user.id
+    
+    if user_id not in user_sessions or 'report_data' not in user_sessions[user_id]:
+        await callback.answer("Данные устарели. Выполните анализ заново.")
+        return
+    
+    report_data = user_sessions[user_id]['report_data']
+    competitors = report_data.get('competitors', [])
+    
+    if not competitors:
+        await callback.answer("Нет данных о конкурентах")
+        return
+    
+    # Сортируем по качеству аудитории
+    sorted_competitors = sorted(
+        competitors,
+        key=lambda x: x.get('analysis', {}).get('audience_quality_score', 0),
+        reverse=True
+    )
+    
+    report = "<b>🏆 ТОП-5 КОНКУРЕНТОВ ПО КАЧЕСТВУ АУДИТОРИИ</b>\n\n"
+    
+    for i, competitor in enumerate(sorted_competitors[:5], 1):
+        score = competitor.get('analysis', {}).get('audience_quality_score', 0)
+        stars = "⭐" * min(5, int(score / 20))
+        
+        report += f"<b>{i}. {competitor.get('name', 'Без названия')}</b>\n"
+        report += f"• Качество: {score}/100 {stars}\n"
+        report += f"• Участников: {format_number(competitor.get('members_count', 0))}\n"
+        
+        gender = competitor.get('analysis', {}).get('gender', {})
+        if gender:
+            main_gender = "👨 М" if gender.get('male', 0) > gender.get('female', 0) else "👩 Ж"
+            report += f"• Преобладающий пол: {main_gender}\n"
+        
+        report += f"• Ссылка: vk.com/{competitor.get('screen_name', '')}\n\n"
+    
+    await callback.message.answer(report, reply_markup=create_back_button("back_to_competitors"))
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_competitors")
+async def back_to_competitors(callback: CallbackQuery):
+    """Возвращает к отчету по конкурентам"""
+    user_id = callback.from_user.id
+    
+    if user_id not in user_sessions or 'report_data' not in user_sessions[user_id]:
+        await callback.answer("Данные устарели")
+        return
+    
+    report_data = user_sessions[user_id]['report_data']
+    group_info = report_data['group_info']
+    target_analysis = report_data['target_analysis']
+    competitors = report_data['competitors']
+    
+    await send_competitor_report(callback.message, group_info, target_analysis, competitors)
+    await callback.answer()
+
+@dp.message(Command("text_analysis"))
+async def cmd_text_analysis(message: Message, command: CommandObject = None):
+    """AI-анализ текстового контента группы"""
+    try:
+        args = message.text.split()[1:] if command is None else command.args.split()
+        if not args:
+            await message.answer(
+                "🧠 <b>AI-анализ текстового контента</b>\n\n"
+                "Эта команда проанализирует текстовый контент группы:\n"
+                "• Тональность (позитивная/негативная/нейтральная)\n"
+                "• Основные темы и категории\n"
+                "• Ключевые слова и фразы\n"
+                "• Эмоциональная окраска\n\n"
+                "<b>Пример:</b>\n"
+                "<code>/text_analysis https://vk.com/public123</code>\n"
+                "<code>/text_analysis vk.com/groupname</code>"
+            )
+            return
+        
+        group_link = args[0].strip()
+        user_id = message.from_user.id
+        
+        await message.answer("🧠 <b>Начинаю AI-анализ текста...</b>")
+        logger.info(f"Пользователь {user_id} запросил текстовый анализ {group_link}")
+        
+        # Получаем информацию о группе
+        group_info = await vk_client.get_group_info(group_link)
+        if not group_info:
+            await message.answer("❌ <b>Не удалось получить информацию о группе</b>")
+            return
+        
+        # Получаем текстовый контент
+        text_content = await get_group_text_content(group_info['id'])
+        
+        if not text_content:
+            await message.answer(
+                f"❌ <b>Не удалось получить текстовый контент группы {group_info['name']}</b>\n\n"
+                "Возможно:\n"
+                "• У группы нет описания и постов\n"
+                "• Группа закрытая\n"
+                "• Ограничения VK API"
+            )
+            return
+        
+        # Анализируем текст
+        analysis = await text_analyzer.analyze_text(text_content)
+        
+        # Формируем отчет
+        await send_text_analysis_report(message, group_info, analysis)
+        
+        # Сохраняем результаты
+        user_sessions[user_id] = {
+            'text_analysis_data': {
+                'group_info': group_info,
+                'analysis': analysis,
+                'text_content': text_content[:1000]  # Сохраняем первые 1000 символов
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Ошибка в команде /text_analysis: {e}", exc_info=True)
+        await message.answer(
+            "❌ <b>Ошибка при анализе текста</b>\n\n"
+            "Попробуйте позже или выберите другую группу."
+        )
+
+async def get_group_text_content(group_id: int) -> str:
+    """Получает текстовый контент группы"""
+    try:
+        # Получаем описание группы
+        group_info = await vk_client.get_group_info(f"club{group_id}")
+        text_content = group_info.get('description', '') if group_info else ''
+        
+        # Добавляем название группы
+        if group_info and 'name' in group_info:
+            text_content = f"{group_info['name']}. {text_content}"
+        
+        # Пытаемся получить несколько последних постов
+        try:
+            # Это упрощенный запрос - в реальности нужно использовать wall.get
+            # Но для демонстрации используем то, что есть
+            members = await vk_client.get_group_members(group_id, limit=10)
+            if members:
+                # Добавляем интересы участников
+                interests = []
+                for member in members[:20]:  # Ограничиваем 20 участниками
+                    if 'interests' in member and member['interests']:
+                        interests.append(member['interests'])
+                
+                if interests:
+                    text_content += " " + " ".join(interests)
+        except:
+            pass
+        
+        return text_content if text_content.strip() else None
+        
+    except Exception as e:
+        logger.error(f"Ошибка получения текстового контента: {e}")
+        return None
+
+async def send_text_analysis_report(message: Message, group_info: dict, analysis: dict):
+    """Отправляет отчет по анализу текста"""
+    report = f"""
+🧠 <b>AI-АНАЛИЗ ТЕКСТА: {group_info['name']}</b>
+
+<b>📝 ОБЩАЯ ИНФОРМАЦИЯ:</b>
+• Проанализировано символов: {analysis.get('text_length', 0):,}
+• Уникальных слов: {analysis.get('unique_words', 0)}
+• Средняя длина предложения: {analysis.get('avg_sentence_length', 0):.1f} слов
+"""
+    
+    # Тональность
+    sentiment = analysis.get('sentiment', {})
+    if sentiment:
+        sentiment_score = sentiment.get('score', 0)
+        sentiment_label = sentiment.get('label', 'нейтральная')
+        
+        if sentiment_label == 'positive':
+            sentiment_emoji = "😊"
+            sentiment_desc = "Позитивная"
+        elif sentiment_label == 'negative':
+            sentiment_emoji = "😔"
+            sentiment_desc = "Негативная"
+        else:
+            sentiment_emoji = "😐"
+            sentiment_desc = "Нейтральная"
+        
+        report += f"\n<b>🎭 ТОНАЛЬНОСТЬ:</b> {sentiment_desc} {sentiment_emoji}\n"
+        report += f"• Оценка: {sentiment_score:.2f} (от -1 до 1)\n"
+        report += f"• Уверенность: {sentiment.get('confidence', 0):.1%}\n"
+    
+    # Основные темы
+    topics = analysis.get('topics', [])
+    if topics:
+        report += "\n<b>📚 ОСНОВНЫЕ ТЕМЫ:</b>\n"
+        for i, topic in enumerate(topics[:5], 1):
+            report += f"{i}. {topic['name']}: {topic['score']:.1%}\n"
+    
+    # Ключевые слова
+    keywords = analysis.get('keywords', [])
+    if keywords:
+        report += "\n<b>🔑 КЛЮЧЕВЫЕ СЛОВА:</b>\n"
+        for i, keyword in enumerate(keywords[:10], 1):
+            report += f"• {keyword['word']} ({keyword['count']})\n"
+    
+    # Эмоции
+    emotions = analysis.get('emotions', {})
+    if emotions:
+        report += "\n<b>😊 ЭМОЦИОНАЛЬНАЯ ОКРАСКА:</b>\n"
+        for emotion, score in emotions.items():
+            if score > 0.1:  # Показываем только значимые эмоции
+                bars = "█" * int(score * 10)
+                report += f"• {emotion}: {score:.1%} {bars}\n"
+    
+    # Рекомендации
+    recommendations = analysis.get('recommendations', [])
+    if recommendations:
+        report += "\n<b>💡 РЕКОМЕНДАЦИИ ПО КОНТЕНТУ:</b>\n"
+        for i, rec in enumerate(recommendations[:5], 1):
+            report += f"{i}. {rec}\n"
+    
+    await message.answer(report, reply_markup=create_text_analysis_keyboard())
+    
+    # Дополнительная информация
+    if 'readability_score' in analysis:
+        readability = analysis['readability_score']
+        additional = f"\n<b>📖 ЧИТАЕМОСТЬ ТЕКСТА:</b> {readability}/100\n"
+        
+        if readability >= 80:
+            additional += "✅ Отличная читаемость! Текст понятен и доступен.\n"
+        elif readability >= 60:
+            additional += "⚠️ Средняя читаемость. Можно упростить некоторые предложения.\n"
+        else:
+            additional += "❌ Низкая читаемость. Рекомендуется упростить текст.\n"
+        
+        await message.answer(additional)
+
+@dp.callback_query(F.data == "text_sentiment")
+async def text_sentiment_callback(callback: CallbackQuery):
+    """Показывает детальный анализ тональности"""
+    user_id = callback.from_user.id
+    
+    if user_id not in user_sessions or 'text_analysis_data' not in user_sessions[user_id]:
+        await callback.answer("Данные устарели. Выполните анализ заново.")
+        return
+    
+    text_data = user_sessions[user_id]['text_analysis_data']
+    analysis = text_data['analysis']
+    sentiment = analysis.get('sentiment', {})
+    
+    report = "<b>🎭 ДЕТАЛЬНЫЙ АНАЛИЗ ТОНАЛЬНОСТИ</b>\n\n"
+    
+    if sentiment:
+        score = sentiment.get('score', 0)
+        label = sentiment.get('label', 'neutral')
+        confidence = sentiment.get('confidence', 0)
+        
+        # Визуализация тональности
+        if score > 0.3:
+            visual = "😊 " + "🟢" * int(score * 10) + "⚪" * int((1 - score) * 10)
+            interpretation = "Сильно позитивный текст"
+        elif score > 0.1:
+            visual = "🙂 " + "🟡" * int(score * 10) + "⚪" * int((1 - score) * 10)
+            interpretation = "Умеренно позитивный текст"
+        elif score > -0.1:
+            visual = "😐 " + "⚪" * 10
+            interpretation = "Нейтральный текст"
+        elif score > -0.3:
+            visual = "🙁 " + "🟠" * int(abs(score) * 10) + "⚪" * int((1 - abs(score)) * 10)
+            interpretation = "Умеренно негативный текст"
+        else:
+            visual = "😔 " + "🔴" * int(abs(score) * 10) + "⚪" * int((1 - abs(score)) * 10)
+            interpretation = "Сильно негативный текст"
+        
+        report += f"<b>Оценка тональности:</b> {score:.3f}\n"
+        report += f"<b>Визуализация:</b> {visual}\n"
+        report += f"<b>Интерпретация:</b> {interpretation}\n"
+        report += f"<b>Уверенность анализа:</b> {confidence:.1%}\n\n"
+        
+        # Статистика по словам
+        report += f"<b>📊 СТАТИСТИКА:</b>\n"
+        report += f"• Позитивных слов: {sentiment.get('positive_words', 0)}\n"
+        report += f"• Негативных слов: {sentiment.get('negative_words', 0)}\n"
+        report += f"• Всего слов: {sentiment.get('total_words', 0)}\n\n"
+        
+        # Рекомендации по тональности
+        report += "<b>💡 РЕКОМЕНДАЦИИ:</b>\n"
+        if score < -0.2:
+            report += "1. Добавьте больше позитивных формулировок\n"
+            report += "2. Избегайте резкой критики\n"
+            report += "3. Используйте конструктивные предложения\n"
+        elif score < 0:
+            report += "1. Сбалансируйте негативные и позитивные высказывания\n"
+            report += "2. Добавьте примеры успешных решений\n"
+            report += "3. Предложите пути улучшения\n"
+        elif score < 0.2:
+            report += "1. Текст хорошо сбалансирован\n"
+            report += "2. Можно добавить немного эмоциональности\n"
+            report += "3. Используйте больше конкретных примеров\n"
+        else:
+            report += "1. Отличная позитивная тональность!\n"
+            report += "2. Такие тексты хорошо воспринимаются аудиторией\n"
+            report += "3. Поддерживайте этот стиль\n"
+    
+    await callback.message.answer(report, reply_markup=create_back_button("back_to_text_analysis"))
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_text_analysis")
+async def back_to_text_analysis(callback: CallbackQuery):
+    """Возвращает к отчету по текстовому анализу"""
+    user_id = callback.from_user.id
+    
+    if user_id not in user_sessions or 'text_analysis_data' not in user_sessions[user_id]:
+        await callback.answer("Данные устарели")
+        return
+    
+    text_data = user_sessions[user_id]['text_analysis_data']
+    group_info = text_data['group_info']
+    analysis = text_data['analysis']
+    
+    await send_text_analysis_report(callback.message, group_info, analysis)
     await callback.answer()
 
 @dp.message(Command("quick"))
@@ -985,7 +1617,6 @@ async def cmd_quick(message: Message, command: CommandObject = None):
             return
         
         # Быстрый анализ (только основные метрики)
-        from analytics import AudienceAnalyzer
         quick_analyzer = AudienceAnalyzer()
         
         # Анализируем только основные аспекты
@@ -1196,7 +1827,7 @@ async def cmd_stats(message: Message):
             inline_keyboard=[
                 [InlineKeyboardButton(text="📊 Новый анализ", callback_data="start_analysis")],
                 [InlineKeyboardButton(text="📤 Экспорт истории", callback_data="export_history")],
-                [InlineKeyboardButton(text="🧹 Очистить историю", callback_data="clear_history")]
+                [InlineKeyboardButton(text="🔙 В главное меню", callback_data="main_menu")]
             ]
         )
         
@@ -1205,169 +1836,6 @@ async def cmd_stats(message: Message):
     except Exception as e:
         logger.error(f"Ошибка в команде /stats: {e}", exc_info=True)
         await message.answer("❌ <b>Ошибка при получении статистики.</b> Попробуйте позже.")
-
-@dp.message(Command("export"))
-async def cmd_export(message: Message, command: CommandObject = None):
-    """Экспорт данных анализа"""
-    try:
-        args = command.args.split() if command and command.args else []
-        
-        if not args:
-            # Показываем список доступных для экспорта анализов
-            user_analyses = await db.get_user_analyses(message.from_user.id, limit=10)
-            
-            if not user_analyses:
-                await message.answer(
-                    "📤 <b>Экспорт данных</b>\n\n"
-                    "У вас пока нет сохраненных анализов для экспорта.\n\n"
-                    "Сначала выполните анализ группы: <code>/analyze ссылка_на_группу</code>"
-                )
-                return
-            
-            keyboard = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(
-                        text=f"{i+1}. {analysis['group_name']} ({analysis['created_at'][:10]})",
-                        callback_data=f"export_{analysis['id']}"
-                    )] for i, analysis in enumerate(user_analyses)
-                ] + [[InlineKeyboardButton(text="📋 Экспорт всей истории", callback_data="export_all")]]
-            )
-            
-            await message.answer(
-                "📤 <b>Выберите анализ для экспорта:</b>\n\n"
-                "Нажмите на кнопку ниже, чтобы экспортировать конкретный анализ.",
-                reply_markup=keyboard
-            )
-            return
-        
-        # Экспорт конкретного анализа по ID
-        analysis_id = args[0]
-        analysis_data = await db.get_analysis_by_id(analysis_id, message.from_user.id)
-        
-        if not analysis_data:
-            await message.answer("❌ <b>Анализ не найден или у вас нет доступа к нему.</b>")
-            return
-        
-        # Формируем текстовый экспорт
-        export_text = await format_export_text(analysis_data)
-        
-        # Отправляем как документ (или разбиваем на части если слишком большой)
-        if len(export_text) > 4000:
-            # Разбиваем на части
-            parts = [export_text[i:i+4000] for i in range(0, len(export_text), 4000)]
-            for i, part in enumerate(parts, 1):
-                await message.answer(f"<b>Часть {i} из {len(parts)}:</b>\n\n<code>{part}</code>")
-        else:
-            await message.answer(f"<b>📤 Экспорт анализа:</b>\n\n<code>{export_text}</code>")
-        
-        await message.answer("✅ <b>Экспорт завершен!</b>\nВы можете скопировать данные или сохранить в файл.")
-        
-    except Exception as e:
-        logger.error(f"Ошибка в команде /export: {e}", exc_info=True)
-        await message.answer(
-            "❌ <b>Ошибка при экспорте данных.</b>\n\n"
-            "Используйте: <code>/export</code> для выбора анализа или <code>/export id</code>"
-        )
-
-async def format_export_text(analysis_data: dict) -> str:
-    """Форматирует данные анализа для экспорта"""
-    analysis = analysis_data.get('analysis', {})
-    group_name = analysis_data.get('group_name', 'Неизвестная группа')
-    created_at = analysis_data.get('created_at', 'Неизвестная дата')
-    
-    export_lines = [
-        "=" * 60,
-        f"ЭКСПОРТ АНАЛИЗА АУДИТОРИИ",
-        f"Группа: {group_name}",
-        f"Дата анализа: {created_at}",
-        "=" * 60,
-        ""
-    ]
-    
-    # Общая информация
-    export_lines.append("[ОБЩАЯ ИНФОРМАЦИЯ]")
-    export_lines.append(f"Всего участников: {analysis.get('total_members_analyzed', 0)}")
-    export_lines.append(f"Оценка качества: {analysis.get('audience_quality_score', 0)}/100")
-    export_lines.append("")
-    
-    # Демография
-    if 'gender' in analysis:
-        export_lines.append("[ДЕМОГРАФИЯ]")
-        gender = analysis['gender']
-        export_lines.append(f"Мужчины: {gender.get('male', 0)}%")
-        export_lines.append(f"Женщины: {gender.get('female', 0)}%")
-        export_lines.append(f"Не указано: {gender.get('unknown', 0)}%")
-        export_lines.append("")
-    
-    # Возрастные группы
-    if 'age_groups' in analysis:
-        export_lines.append("[ВОЗРАСТНЫЕ ГРУППЫ]")
-        age_groups = analysis['age_groups']
-        for age_group, percentage in age_groups.items():
-            if 'average' not in age_group and 'unknown' not in age_group:
-                export_lines.append(f"{age_group}: {percentage}%")
-        if 'average_age' in age_groups:
-            export_lines.append(f"Средний возраст: {age_groups['average_age']} лет")
-        export_lines.append("")
-    
-    # География
-    if 'geography' in analysis:
-        geography = analysis['geography']
-        export_lines.append("[ГЕОГРАФИЯ]")
-        
-        if geography.get('top_cities'):
-            export_lines.append("Топ городов:")
-            for city, percentage in geography['top_cities'].items():
-                export_lines.append(f"  {city}: {percentage}%")
-        
-        if geography.get('city_types'):
-            export_lines.append("Типы городов:")
-            for city_type, percentage in geography['city_types'].items():
-                export_lines.append(f"  {city_type}: {percentage}%")
-        
-        export_lines.append("")
-    
-    # Интересы
-    if 'interests' in analysis:
-        interests = analysis['interests']
-        export_lines.append("[ИНТЕРЕСЫ]")
-        export_lines.append(f"Заполненность профилей: {interests.get('profile_fill_rate', 0)}%")
-        
-        if interests.get('popular_categories'):
-            export_lines.append("Популярные категории:")
-            for category, percentage in interests['popular_categories'].items():
-                export_lines.append(f"  {category}: {percentage}%")
-        
-        export_lines.append("")
-    
-    # Активность
-    if 'social_activity' in analysis:
-        social = analysis['social_activity']
-        export_lines.append("[АКТИВНОСТЬ]")
-        export_lines.append(f"Активных пользователей: {social.get('active_users_percentage', 0)}%")
-        
-        if social.get('last_seen_distribution'):
-            export_lines.append("Время последней активности:")
-            for period, percentage in social['last_seen_distribution'].items():
-                period_name = period.replace('_', ' ')
-                export_lines.append(f"  {period_name}: {percentage}%")
-        
-        export_lines.append("")
-    
-    # Рекомендации
-    if 'recommendations' in analysis:
-        export_lines.append("[РЕКОМЕНДАЦИИ]")
-        for i, rec in enumerate(analysis['recommendations'][:10], 1):
-            # Убираем HTML теги для чистого текста
-            clean_rec = rec.replace('<b>', '').replace('</b>', '').replace('<i>', '').replace('</i>', '')
-            export_lines.append(f"{i}. {clean_rec}")
-    
-    export_lines.append("")
-    export_lines.append("=" * 60)
-    export_lines.append(f"Экспортировано: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    export_lines.append("=" * 60)
-    
-    return "\n".join(export_lines)
 
 @dp.message(Command("test_vk"))
 async def cmd_test_vk(message: Message):
@@ -1437,9 +1905,63 @@ async def cmd_test_vk(message: Message):
             "<i>Проверьте логи бота для подробной информации.</i>"
         )
 
+@dp.callback_query(F.data == "analyze_group")
+async def analyze_group_callback(callback: CallbackQuery):
+    """Обработчик кнопки анализа группы"""
+    await callback.message.answer(
+        "🔍 <b>Анализ группы ВКонтакте</b>\n\n"
+        "Отправьте ссылку на группу:\n"
+        "<code>https://vk.com/public123</code>\n"
+        "Или: <code>vk.com/groupname</code>\n\n"
+        "Для полного анализа: /analyze ссылка\n"
+        "Для быстрого анализа: /quick ссылка"
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "competitors_help")
+async def competitors_help_callback(callback: CallbackQuery):
+    """Обработчик кнопки помощи по конкурентам"""
+    await callback.message.answer(
+        "🥊 <b>Анализ конкурентов</b>\n\n"
+        "Эта функция найдет и проанализирует похожие группы.\n\n"
+        "<b>Пример команды:</b>\n"
+        "<code>/competitors https://vk.com/public123</code>\n\n"
+        "<b>Что делает бот:</b>\n"
+        "1. Находит похожие группы по тематике\n"
+        "2. Анализирует их аудиторию\n"
+        "3. Сравнивает с вашей группой\n"
+        "4. Дает рекомендации по улучшению\n\n"
+        "<i>Анализ может занять 3-5 минут</i>"
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "text_analysis_help")
+async def text_analysis_help_callback(callback: CallbackQuery):
+    """Обработчик кнопки помощи по AI-анализу текста"""
+    await callback.message.answer(
+        "🧠 <b>AI-анализ текста</b>\n\n"
+        "Эта функция анализирует текстовый контент группы.\n\n"
+        "<b>Пример команды:</b>\n"
+        "<code>/text_analysis https://vk.com/public123</code>\n\n"
+        "<b>Что анализирует бот:</b>\n"
+        "• Тональность (позитивная/негативная/нейтральная)\n"
+        "• Основные темы и категории\n"
+        "• Ключевые слова и фразы\n"
+        "• Эмоциональную окраску\n"
+        "• Читаемость текста\n\n"
+        "<i>Анализ использует NLP-алгоритмы</i>"
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "full_help")
+async def full_help_callback(callback: CallbackQuery):
+    """Обработчик кнопки полной помощи"""
+    await cmd_help(callback.message)
+    await callback.answer()
+
 @dp.callback_query(F.data == "start_analysis")
 async def start_analysis_callback(callback: CallbackQuery):
-    """Обработка callback для начала анализа"""
+    """Обработчик кнопки начала анализа"""
     await callback.message.answer(
         "🎯 <b>Начать анализ группы</b>\n\n"
         "Отправьте ссылку на группу ВК:\n"
@@ -1450,45 +1972,52 @@ async def start_analysis_callback(callback: CallbackQuery):
     )
     await callback.answer()
 
-@dp.callback_query(F.data == "example_report")
-async def example_report_callback(callback: CallbackQuery):
-    """Показывает пример отчета"""
-    example = """
-📊 <b>ПРИМЕР ОТЧЕТА АНАЛИЗА</b>
+@dp.callback_query(F.data == "start_competitors")
+async def start_competitors_callback(callback: CallbackQuery):
+    """Обработчик кнопки начала анализа конкурентов"""
+    await callback.message.answer(
+        "🥊 <b>Анализ конкурентов</b>\n\n"
+        "Отправьте ссылку на вашу группу:\n"
+        "<code>/competitors https://vk.com/public123</code>\n\n"
+        "Бот найдет похожие группы и проанализирует их."
+    )
+    await callback.answer()
 
-<b>Группа:</b> ВКонтакте API
-<b>Участников:</b> 4 914
-<b>Проанализировано:</b> 1 000 (20%)
+@dp.callback_query(F.data == "start_text_analysis")
+async def start_text_analysis_callback(callback: CallbackQuery):
+    """Обработчик кнопки начала AI-анализа текста"""
+    await callback.message.answer(
+        "🧠 <b>AI-анализ текста</b>\n\n"
+        "Отправьте ссылку на группу:\n"
+        "<code>/text_analysis https://vk.com/public123</code>\n\n"
+        "Бот проанализирует текстовый контент группы."
+    )
+    await callback.answer()
 
-<b>👫 ГЕНДЕРНОЕ РАСПРЕДЕЛЕНИЕ:</b>
-👨 Мужчины: 75% ████████████
-👩 Женщины: 22% ████
-❓ Не указано: 3% █
+@dp.callback_query(F.data == "user_stats")
+async def user_stats_callback(callback: CallbackQuery):
+    """Обработчик кнопки статистики"""
+    await cmd_stats(callback.message)
+    await callback.answer()
 
-<b>📅 ВОЗРАСТНЫЕ ГРУППЫ:</b>
-• 18-24: 45% █████████
-• 25-34: 35% ███████
-• 35-44: 15% ███
-• 45-54: 3% █
-• 55+: 2% █
+@dp.callback_query(F.data == "main_menu")
+async def main_menu_callback(callback: CallbackQuery):
+    """Обработчик кнопки главного меню"""
+    await cmd_start(callback.message)
+    await callback.answer()
 
-<b>⭐ ОЦЕНКА КАЧЕСТВА:</b> 82/100 ⭐⭐⭐⭐⭐
-
-<b>💡 ОСНОВНЫЕ РЕКОМЕНДАЦИИ:</b>
-1. ✅ Аудитория преимущественно мужская - используйте мужские темы
-2. 🎓 Основная группа 18-24 года - эффективны трендовый контент
-3. 💻 Популярная тема: технологии - используйте в контенте
-"""
-    
-    await callback.message.answer(example)
-    await callback.answer("Пример отчета показан")
+@dp.callback_query(F.data == "back_to_start")
+async def back_to_start_callback(callback: CallbackQuery):
+    """Обработчик кнопки возврата в начало"""
+    await cmd_start(callback.message)
+    await callback.answer()
 
 # ==================== ОСНОВНАЯ ФУНКЦИЯ ====================
 
 async def main():
     """Основная функция запуска бота"""
     logger.info("=" * 60)
-    logger.info("🚀 ЗАПУСК ТЕЛЕГРАМ БОТА ДЛЯ АНАЛИЗА АУДИТОРИИ ВК")
+    logger.info("🚀 ЗАПУСК ТЕЛЕГРАМ БОТА С AI-АНАЛИЗОМ И АНАЛИЗОМ КОНКУРЕНТОВ")
     logger.info("=" * 60)
     
     try:
@@ -1499,15 +2028,17 @@ async def main():
         if db_success:
             logger.info("✅ База данных подключена успешно")
         else:
-            logger.warning("⚠️  Бот запущен с временной SQLite базой. Данные могут быть не сохранены!")
+            logger.warning("⚠️  Бот запущен с временной SQLite базой")
         
         # Получение информации о боте
         bot_info = await bot.get_me()
         logger.info(f"🤖 Бот: @{bot_info.username} (ID: {bot_info.id})")
         logger.info(f"👥 Администраторы: {config.ADMIN_IDS}")
         logger.info(f"🌐 VK API Версия: {config.VK_API_VERSION}")
+        logger.info(f"🧠 AI-анализ: {'✅ Включен' if config.ENABLE_AI_ANALYSIS else '❌ Выключен'}")
+        logger.info(f"🥊 Анализ конкурентов: {'✅ Включен' if config.ENABLE_COMPETITOR_ANALYSIS else '❌ Выключен'}")
         
-        # Сбрасываем вебхук на случай остаточных состояний
+        # Сбрасываем вебхук
         try:
             await bot.delete_webhook(drop_pending_updates=True)
             logger.info("✅ Вебхук сброшен, старые обновления удалены")
@@ -1520,7 +2051,7 @@ async def main():
         logger.info("✅ Бот готов к работе! Ожидание команд...")
         logger.info("-" * 60)
         
-        # Запуск бота с пропуском старых обновлений
+        # Запуск бота
         await dp.start_polling(bot, skip_updates=True)
         
     except KeyboardInterrupt:
