@@ -1,5 +1,4 @@
 import logging
-import json
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -17,7 +16,7 @@ class AnalysisResult(Base):
     
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, index=True)
-    group_id = Column(String, index=True)  # Используем String для VK ID
+    group_id = Column(String, index=True)  # String для VK ID
     group_name = Column(String)
     analysis_data = Column(JSON)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -39,7 +38,6 @@ class Database:
         self.async_session = None
     
     def _normalize_db_url(self, db_url: str) -> str:
-        """Нормализация URL базы данных для SQLAlchemy"""
         if not db_url:
             logger.warning("DATABASE_URL пустой, используется SQLite")
             return "sqlite+aiosqlite:///database.db"
@@ -57,7 +55,6 @@ class Database:
         return db_url
     
     async def init_db(self) -> bool:
-        """Инициализация базы данных"""
         try:
             db_url = self._normalize_db_url(config.DATABASE_URL)
             logger.info(f"Инициализация БД с URL: {db_url[:50]}...")
@@ -67,8 +64,7 @@ class Database:
                 echo=False,
                 pool_size=10,
                 max_overflow=20,
-                pool_pre_ping=True,
-                connect_args={"server_settings": {"jit": "off"}} if "postgresql" in db_url else {}
+                pool_pre_ping=True
             )
             
             self.async_session = sessionmaker(
@@ -80,7 +76,6 @@ class Database:
             async with self.engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
             
-            # Проверяем соединение
             async with self.async_session() as session:
                 await session.execute(select(1))
             
@@ -89,37 +84,30 @@ class Database:
             
         except Exception as e:
             logger.error(f"❌ Ошибка инициализации базы данных: {e}")
+            logger.info("Создается in-memory SQLite база")
+            self.engine = create_async_engine(
+                "sqlite+aiosqlite:///:memory:",
+                echo=False
+            )
+            self.async_session = sessionmaker(
+                self.engine,
+                class_=AsyncSession,
+                expire_on_commit=False
+            )
             
-            # Fallback на SQLite
-            try:
-                logger.info("Создается in-memory SQLite база")
-                self.engine = create_async_engine(
-                    "sqlite+aiosqlite:///:memory:",
-                    echo=False
-                )
-                self.async_session = sessionmaker(
-                    self.engine,
-                    class_=AsyncSession,
-                    expire_on_commit=False
-                )
-                
-                async with self.engine.begin() as conn:
-                    await conn.run_sync(Base.metadata.create_all)
-                
-                logger.info("✅ In-memory SQLite база создана")
-                return True
-            except Exception as sqlite_error:
-                logger.error(f"❌ Ошибка создания SQLite базы: {sqlite_error}")
-                return False
+            async with self.engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            
+            return False
     
-    async def save_analysis(self, user_id: int, group_id: int, 
+    async def save_analysis(self, user_id: int, group_id: str, 
                            group_name: str, analysis: Dict[str, Any]) -> bool:
         """
         Сохраняет результат анализа в базу данных
         
         Args:
             user_id: ID пользователя Telegram
-            group_id: ID группы ВК (может быть int или str)
+            group_id: ID группы ВК (должен быть строкой)
             group_name: Название группы
             analysis: Данные анализа
             
@@ -128,8 +116,8 @@ class Database:
         """
         try:
             async with self.async_session() as session:
-                # Явно преобразуем group_id в строку для PostgreSQL
-                group_id_str = str(group_id)
+                # Убедимся, что group_id - строка
+                group_id_str = str(group_id) if not isinstance(group_id, str) else group_id
                 
                 analysis_record = AnalysisResult(
                     user_id=user_id,
@@ -158,30 +146,40 @@ class Database:
             return False
         except Exception as e:
             logger.error(f"❌ Ошибка сохранения анализа: {e}", exc_info=True)
-            return False
+            
+            # Пробуем альтернативный метод сохранения
+            try:
+                return await self._save_analysis_raw(user_id, group_id, group_name, analysis)
+            except Exception as e2:
+                logger.error(f"❌ Альтернативный метод также не сработал: {e2}")
+                return False
     
-    async def save_analysis_with_fallback(self, user_id: int, group_id: int, 
-                                         group_name: str, analysis: Dict[str, Any]) -> bool:
-        """
-        Сохраняет анализ с обработкой ошибок типов данных для PostgreSQL
-        """
+    async def _save_analysis_raw(self, user_id: int, group_id: str, 
+                                group_name: str, analysis: Dict[str, Any]) -> bool:
+        """Альтернативный метод сохранения через сырой SQL"""
         try:
             async with self.async_session() as session:
-                # Используем сырой SQL для явного указания типов
-                group_id_str = str(group_id)
+                # Используем сырой SQL с явным приведением типов
+                group_id_str = str(group_id) if not isinstance(group_id, str) else group_id
                 
-                # Формируем запрос с явным приведением типов
-                query = text("""
-                    INSERT INTO analyses (user_id, group_id, group_name, analysis_data, created_at)
-                    VALUES (:user_id, :group_id, :group_name, :analysis_data, :created_at)
-                    RETURNING id
-                """)
+                # Для PostgreSQL используем явное приведение типов
+                if "postgresql" in str(self.engine.url):
+                    query = text("""
+                        INSERT INTO analyses (user_id, group_id, group_name, analysis_data, created_at)
+                        VALUES (:user_id, :group_id::VARCHAR, :group_name, :analysis_data, :created_at)
+                    """)
+                else:
+                    # Для SQLite
+                    query = text("""
+                        INSERT INTO analyses (user_id, group_id, group_name, analysis_data, created_at)
+                        VALUES (:user_id, :group_id, :group_name, :analysis_data, :created_at)
+                    """)
                 
-                result = await session.execute(query, {
+                await session.execute(query, {
                     'user_id': user_id,
-                    'group_id': group_id_str,  # Строка
+                    'group_id': group_id_str,
                     'group_name': group_name[:255],
-                    'analysis_data': json.dumps(analysis, ensure_ascii=False),
+                    'analysis_data': analysis,
                     'created_at': datetime.utcnow()
                 })
                 
@@ -205,29 +203,7 @@ class Database:
                 
         except Exception as e:
             logger.error(f"❌ Ошибка сохранения анализа (raw SQL): {e}", exc_info=True)
-            
-            # Пробуем сохранить без статистики
-            try:
-                async with self.async_session() as session:
-                    query = text("""
-                        INSERT INTO analyses (user_id, group_id, group_name, analysis_data, created_at)
-                        VALUES (:user_id, :group_id, :group_name, :analysis_data, :created_at)
-                    """)
-                    
-                    await session.execute(query, {
-                        'user_id': user_id,
-                        'group_id': str(group_id),
-                        'group_name': group_name[:255],
-                        'analysis_data': json.dumps(analysis, ensure_ascii=False),
-                        'created_at': datetime.utcnow()
-                    })
-                    
-                    await session.commit()
-                    logger.info(f"✅ Анализ сохранен (упрощенный): user_id={user_id}")
-                    return True
-            except Exception as e2:
-                logger.error(f"❌ Критическая ошибка сохранения: {e2}")
-                return False
+            return False
     
     async def get_user_stats(self, user_id: int) -> Dict[str, Any]:
         """Получает статистику пользователя"""
@@ -321,76 +297,6 @@ class Database:
         except Exception as e:
             logger.error(f"Ошибка получения анализа по ID: {e}")
             return None
-    
-    async def check_db_health(self) -> Dict[str, Any]:
-        """Проверяет здоровье базы данных"""
-        try:
-            async with self.async_session() as session:
-                # Проверяем подключение
-                await session.execute(select(1))
-                
-                # Получаем статистику таблиц
-                analyses_count = await self.get_total_analyses_count()
-                users_count = await self.get_total_users_count()
-                
-                return {
-                    'status': 'healthy',
-                    'analyses_count': analyses_count,
-                    'users_count': users_count,
-                    'timestamp': datetime.utcnow().isoformat()
-                }
-        except Exception as e:
-            logger.error(f"Ошибка проверки здоровья БД: {e}")
-            return {
-                'status': 'unhealthy',
-                'error': str(e),
-                'timestamp': datetime.utcnow().isoformat()
-            }
-    
-    async def get_total_analyses_count(self) -> int:
-        """Получает общее количество анализов"""
-        try:
-            async with self.async_session() as session:
-                query = select(sqlalchemy.func.count(AnalysisResult.id))
-                result = await session.execute(query)
-                return result.scalar() or 0
-        except Exception as e:
-            logger.error(f"Ошибка получения общего количества анализов: {e}")
-            return 0
-    
-    async def get_total_users_count(self) -> int:
-        """Получает количество уникальных пользователей"""
-        try:
-            async with self.async_session() as session:
-                query = select(sqlalchemy.func.count(sqlalchemy.distinct(AnalysisResult.user_id)))
-                result = await session.execute(query)
-                return result.scalar() or 0
-        except Exception as e:
-            logger.error(f"Ошибка получения количества пользователей: {e}")
-            return 0
-    
-    async def cleanup_old_data(self, days: int = 30) -> int:
-        """Очищает старые данные"""
-        try:
-            cutoff_date = datetime.utcnow() - timedelta(days=days)
-            async with self.async_session() as session:
-                # Удаляем старые анализы
-                delete_query = text("""
-                    DELETE FROM analyses 
-                    WHERE created_at < :cutoff_date
-                """)
-                
-                result = await session.execute(delete_query, {'cutoff_date': cutoff_date})
-                deleted_count = result.rowcount
-                
-                if deleted_count > 0:
-                    logger.info(f"Удалено {deleted_count} старых анализов")
-                
-                await session.commit()
-                return deleted_count
-        except Exception as e:
-            logger.error(f"Ошибка очистки старых данных: {e}")
-            return 0
     
     async def close(self):
         """Закрывает соединения с базой данных"""
